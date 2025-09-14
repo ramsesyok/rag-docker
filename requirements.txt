@@ -1,0 +1,13 @@
+python-dotenv
+llama-index>=0.10
+llama-index-llms-ollama
+llama-index-vector-stores-qdrant
+llama-index-embeddings-huggingface
+qdrant-client
+sentence-transformers
+tree_sitter
+tree_sitter_languages
+# UI + /code_search API
+chainlit
+fastapi
+uvicorn
