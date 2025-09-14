@@ -6,14 +6,22 @@ app.py
 - LLM は Ollama（別PCでも可、環境変数 OLLAMA_BASE_URL）。
 - 埋め込みは HuggingFaceEmbedding（OpenAIキー不要）。ingest.py と同じ EMBED_MODEL を使うこと。
 
-必要な環境変数（.env 推奨）
-  OLLAMA_BASE_URL=http://host.docker.internal:11434   # or 別PCのIP:11434
+【超ざっくり流れ（初心者向け）】
+1) Qdrant（ベクタDB）に ingest.py で投入済みのベクトルを使って、質問文を意味検索（RAGの取得）
+2) 取得したスニペットを再ランク（CrossEncoder）して、より関連の高い上位だけ残す
+3) それらを根拠として LLM（Ollama）に回答文の生成を依頼（プロンプトに根拠を詰め込む）
+4) Chat UI（Chainlit）に回答＋引用（ファイル/行番号）を表示
+
+【必要な環境変数（.env 推奨）】
+  OLLAMA_BASE_URL=http://host.docker.internal:11434   # または別PCのIP:11434（Docker内からホストのOllamaへ）
   OLLAMA_MODEL=llama3:13b
   EMBED_MODEL=BAAI/bge-m3
   QDRANT_URL=http://qdrant:6333
   QDRANT_COLLECTION=codebase
   API_PORT=8001
   LOG_LEVEL=INFO    # DEBUG/INFO/WARN/ERROR
+
+ヒント: まず ingest.py を実行して Qdrant にデータを投入→ 次に app.py を起動すると質問できるようになります。
 """
 
 import os
@@ -65,6 +73,8 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "BAAI/bge-m3")
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 
 # LLM (Ollama)
+# ポイント: OpenAI API は使わずローカル/別PCの Ollama を利用します。
+#           base_url は Docker から見た Ollama の場所（host.docker.internal など）に合わせます。
 Settings.llm = Ollama(
     model=os.environ.get("OLLAMA_MODEL", "llama3:13b"),
     base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
@@ -72,22 +82,30 @@ Settings.llm = Ollama(
 )
 
 # Embedding（OpenAIの既定を回避）
+# ポイント: ingest.py と同じ埋め込みモデル名を必ず指定してください（検索側と登録側で揃える）。
 Settings.embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
 log.info(f"Embedding model = {EMBED_MODEL}")
 
 # Qdrant 接続＆Index
+# ポイント: 既に Qdrant に入っているベクトルを検索するためのインデックスを作成します。
 qclient = QdrantClient(url=QDRANT_URL)
 vstore = QdrantVectorStore(client=qclient, collection_name=COLLECTION)
 storage = StorageContext.from_defaults(vector_store=vstore)
 index = VectorStoreIndex.from_vector_store(vstore)
 
 # 再ランカー（最初のロードは少し時間がかかります）
+# ポイント: CrossEncoder は「質問×スニペット」をペアで評価して関連度を再計算します。
 log.info(f"Loading reranker: {RERANK_MODEL} ...")
 reranker = CrossEncoder(RERANK_MODEL)
 log.info("Reranker ready.")
 
 # ======== 共有ユーティリティ ========
 def rerank_nodes(query: str, nodes: List[Any], top_k: int = 6) -> List[Any]:
+    """意味検索の初期結果を CrossEncoder で並べ替え、上位 top_k を返す。
+
+    初期の `nodes` はベクトル類似度で近い順ですが、
+    CrossEncoder（再ランク）で「本当に質問に答えるのに良いスニペットか」を再評価します。
+    """
     if not nodes:
         return []
     texts, unwrapped = [], []
@@ -116,6 +134,11 @@ def rerank_nodes(query: str, nodes: List[Any], top_k: int = 6) -> List[Any]:
     return [n for n, _ in ranked[:top_k]]
 
 def build_prompt(question: str, nodes: List[Any]) -> str:
+    """LLM に渡す最終プロンプトを構築する。
+
+    - 根拠スニペットを [repo/path Lstart-Lend] + 本文 で列挙
+    - 回答は「根拠のみで」行うようシステムメッセージで強制
+    """
     context_blocks = []
     for n in nodes:
         m = getattr(n, "metadata", {}) or {}
@@ -131,7 +154,15 @@ def build_prompt(question: str, nodes: List[Any]) -> str:
     return prompt
 
 def run_query_pipeline(question: str, top_k_vec: int = 30, top_k_final: int = 6) -> Tuple[str, List[dict]]:
-    """RAG→再ランク→LLM要約。戻り値: (answer, citations[])"""
+    """質問に答えるための一連の処理（RAG パイプライン）。
+
+    1) ベクトル検索（similarity_top_k=top_k_vec）で粗く候補を拾う
+    2) CrossEncoder（再ランク）で top_k_final まで厳選
+    3) 根拠付きプロンプトを組み立てて LLM へ
+    4) 引用情報（ファイル/行番号）も組み立てて返す
+
+    戻り値: (LLM回答テキスト, 引用メタデータの配列)
+    """
     retriever = index.as_retriever(similarity_top_k=top_k_vec)
     try:
         nodes = retriever.retrieve(question)
@@ -167,6 +198,7 @@ EXT_MAP = {
 }
 
 class CodeSearchReq(BaseModel):
+    # /code_search 用の入力。literal（完全一致）か regex（正規表現）を選べます。
     query: str
     kind: Literal["literal", "regex"] = "literal"
     lang: Optional[List[str]] = None
@@ -176,6 +208,7 @@ class CodeSearchReq(BaseModel):
     before_after_lines: int = 3
 
 class CodeSearchHit(BaseModel):
+    # /code_search の1件分のヒット結果（プレビューは前後行付き）。
     repo: str
     path: str
     lang: str
@@ -184,6 +217,7 @@ class CodeSearchHit(BaseModel):
     preview: str
 
 class QueryReq(BaseModel):
+    # /query 用の入力。top_k は最終的に何件の根拠を使うか。
     question: str
     top_k: int = 6
 
@@ -197,6 +231,12 @@ def _lang_of(path: Path) -> str:
     return "unknown"
 
 def _iter_files(root: Path, langs: Optional[List[str]], globs: Optional[List[str]]):
+    """対象ファイルを列挙。
+
+    - `langs` 指定時は拡張子でフィルタ
+    - `.git` や `node_modules` などは除外
+    - `globs` 指定時はパスのワイルドカードでさらに絞り込み
+    """
     allow_ext = None
     if langs:
         allow_ext = set(e for L in langs for e in EXT_MAP.get(L, []))
@@ -213,6 +253,11 @@ def _iter_files(root: Path, langs: Optional[List[str]], globs: Optional[List[str
         yield p
 
 def _search_with_ripgrep(req: CodeSearchReq) -> List[CodeSearchHit]:
+    """rg（ripgrep）が使える場合はこちらを優先して高速検索。
+
+    JSON 出力をパースして前後行つきのプレビューを整形します。
+    インストールされていない環境では空リストを返し、Python 実装にフォールバック。
+    """
     hits: List[CodeSearchHit] = []
     if shutil.which("rg") is None:
         return hits
@@ -271,6 +316,7 @@ def _search_with_ripgrep(req: CodeSearchReq) -> List[CodeSearchHit]:
     return hits
 
 def _search_with_python(req: CodeSearchReq) -> List[CodeSearchHit]:
+    """rg がないときの純Python版検索（遅いが依存なし）。"""
     hits: List[CodeSearchHit] = []
     flags = 0 if req.case_sensitive else re.IGNORECASE
     rx = re.compile(req.query if req.kind == "regex" else re.escape(req.query), flags)
@@ -298,6 +344,7 @@ def _search_with_python(req: CodeSearchReq) -> List[CodeSearchHit]:
 
 @app.post("/code_search")
 def code_search(req: CodeSearchReq):
+    """コード全文検索API。rg が無ければ Python で代替。"""
     hits = _search_with_ripgrep(req)
     if not hits:
         hits = _search_with_python(req)
@@ -305,6 +352,7 @@ def code_search(req: CodeSearchReq):
 
 @app.post("/query")
 def query(req: QueryReq):
+    """RAG + 再ランク + LLMで回答を生成するAPI。"""
     answer, cits = run_query_pipeline(req.question, top_k_vec=30, top_k_final=req.top_k)
     return {"answer": answer, "citations": cits}
 
@@ -327,6 +375,8 @@ async def on_start():
 
 @cl.on_message
 async def on_message(message):
+    # ユーザーからの1メッセージに対して RAG パイプラインを回して回答を返します。
+    # 重い処理はスレッドに逃がし、Chainlit メッセージは途中で「検索中…」を表示します。
     # message を文字列に
     if isinstance(message, str):
         text = message.strip()
@@ -345,7 +395,7 @@ async def on_message(message):
     ) or "(no references)"
     md = f"{answer}\n\n**References**\n{refs}"
 
-    # Chainlitのバージョン差に対応
+    # Chainlitのバージョン差に対応（update の呼び方が異なるため両対応）
     try:
         # 新しめのAPI: contentをプロパティに代入してからupdate()
         msg.content = md
@@ -360,6 +410,7 @@ from typing import Any
 def gather_citations(nodes: list[Any]) -> list[dict]:
     """
     NodeWithScore / TextNode から、参照用メタデータを抽出して返す。
+    - 表示用に repo/path と行番号を取り出して、Chainlit に渡せる形に整形します。
     run_query_pipeline() の戻り値にそのまま載せます。
     """
     citations: list[dict] = []

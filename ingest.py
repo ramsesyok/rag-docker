@@ -11,6 +11,12 @@ ingest.py (robust logging + Vue/JSX/TSX + fallback)
   * .vue は SFC を script/template に分解して処理
   * 処理内訳（言語別・失敗理由・フォールバック使用数）と Qdrant 件数を出力
 
+【超ざっくり流れ（初心者向け）】
+1) `SRC_ROOT` 直下の各リポを走査し、対象拡張子のファイルを列挙
+2) 1ファイルを CodeSplitter（構造ベース）で分割 → ダメなら SentenceSplitter（文ベース）にフォールバック
+3) チャンクごとにメタデータ（ファイルパス、言語、行番号）を付与して Document 化
+4) すべての Document をまとめて VectorStoreIndex に投入（→ Qdrant に書き込まれる）
+
 環境変数（.env 推奨）
 - SRC_ROOT=./src_repos
 - QDRANT_URL=http://qdrant:6333
@@ -24,6 +30,8 @@ ingest.py (robust logging + Vue/JSX/TSX + fallback)
 - FALLBACK_SENTENCE_SPLITTER=1     # 0で無効
 - SENTENCE_CHUNK=400
 - SENTENCE_OVERLAP=40
+
+ヒント: app.py 側の EMBED_MODEL と必ず一致させてください（検索と登録で同じ埋め込みが必要）。
 """
 
 import os
@@ -113,7 +121,12 @@ except Exception:
 
 # -------- Util --------
 def file_iter(root: Path) -> Iterable[Path]:
-    """対象ファイルを列挙（拡張子・除外ディレクトリ・include_globs を考慮）"""
+    """対象ファイルを列挙（拡張子・除外ディレクトリ・include_globs を考慮）。
+
+    初心者向け補足:
+    - `INCLUDE_GLOBS` を指定すると、そのパターンに合うパスだけを対象にできます。
+    - `.git` や `node_modules` などは自動除外します。
+    """
     from fnmatch import fnmatch
     for p in root.rglob("*"):
         if not p.is_file():
@@ -130,7 +143,12 @@ def file_iter(root: Path) -> Iterable[Path]:
         yield p
 
 def read_text_safely(path: Path) -> Optional[str]:
-    """サイズ上限や読み込み例外に配慮した読み取り"""
+    """サイズ上限や読み込み例外に配慮した読み取り。
+
+    初心者向け補足:
+    - 大きすぎるファイル（`MAX_FILE_MB` 超）はスキップしてメモリ爆発を防ぎます。
+    - 文字コードエラーなどが出ても例外で落ちないように `errors="ignore"` で読みます。
+    """
     try:
         size = path.stat().st_size
     except Exception:
@@ -149,7 +167,12 @@ def read_text_safely(path: Path) -> Optional[str]:
         return None
 
 def compute_line_span_by_streaming(text: str, chunk: str, start_pos: int) -> Tuple[int, int, int]:
-    """チャンクの原文上の開始/終了行を概算（前回終端から検索して誤マッチを抑制）"""
+    """チャンクの原文上の開始/終了行を概算（前回終端から検索して誤マッチを抑制）。
+
+    初心者向け補足:
+    - `text.find(chunk, start_pos)` のように前回の続きから検索して、
+      似た内容のチャンクを誤って別地点に対応付けない工夫です。
+    """
     idx = text.find(chunk, start_pos)
     if idx == -1:
         idx = text.find(chunk)
@@ -164,6 +187,10 @@ def split_vue_sfc(full_text: str):
     """
     .vue を script/template に分割。
     返り値: リスト[{kind:'script'|'template', lang:'javascript'|'typescript'|None, text:str, start_idx:int}]
+
+    初心者向け補足:
+    - `<script lang="ts">` の場合は TypeScript として扱います。
+    - `<template>` は UI テンプレートでコード構造が薄いので、文分割だけで十分です。
     """
     blocks = []
     # <script>（lang="ts" の場合は TypeScript とみなす）
@@ -210,6 +237,8 @@ def inc_lang(lang: str):
 
 # -------- Main --------
 def main() -> None:
+    # 初心者向け補足: ここがエントリポイントです。
+    # - 設定と疎通を確認 → ファイルを集めて分割 → Qdrant に投入、という順で進みます。
     t0 = time.time()
     log.info("=== Ingest start ===")
     log.info(f"SRC_ROOT            : {SRC_ROOT}")
@@ -254,6 +283,8 @@ def main() -> None:
         log.warning("対象ファイルが 0 件です（拡張子/除外設定を確認）")
 
     # 収集・分割
+    # ポイント: 1ファイルずつ読み、言語に応じて CodeSplitter を使い、
+    #            失敗/空のときは SentenceSplitter（フォールバック）でチャンク化します。
     docs: List[Document] = []
     files_processed = 0
     chunks_total = 0
@@ -280,6 +311,8 @@ def main() -> None:
                 continue
 
             # ---- Vue (.vue) 特別処理 ----
+            # ポイント: SFC を script（JS/TS）と template に分解して、
+            #          それぞれに適した分割方法でチャンク化します。
             if lang == "vue":
                 inc_lang("vue")
                 blocks = split_vue_sfc(text)
@@ -292,6 +325,7 @@ def main() -> None:
                         start_line_base = text.count("\n", 0, b["start_idx"]) + 1
 
                         if b["kind"] == "script":
+                            # 初心者向け補足: JS/TS コードは CodeSplitter が有効なことが多いです。
                             # script は JS/TS として CodeSplitter → 失敗時 SentenceSplitter
                             sub_chunks: List[str] = []
                             try:
@@ -332,6 +366,7 @@ def main() -> None:
                             stats["vue_script_chunks"] += len(sub_chunks)
 
                         elif b["kind"] == "template":
+                            # 初心者向け補足: template は文として扱い、構造的な分割は行いません。
                             # template は文分割で十分
                             sub_chunks: List[str] = []
                             try:
@@ -369,6 +404,8 @@ def main() -> None:
             # ---- /Vue 特別処理 ----
 
             # 通常: CodeSplitter → 失敗/空ならフォールバック
+            # 初心者向け補足: CodeSplitter は言語の構造を保った分割を試みます。
+            #                   うまくいかない（エラー/空）場合は文分割に切り替えます。
             splitter = None
             try:
                 splitter = CodeSplitter(language=lang, chunk_lines=0,
@@ -428,6 +465,8 @@ def main() -> None:
     )
 
     # Qdrant へ投入
+    # 初心者向け補足: `VectorStoreIndex.from_documents` を呼ぶと、
+    #                   内部で埋め込みを計算し、Qdrant に point として書き込まれます。
     if not docs:
         log.warning("投入する Document が 0 件です。終了します。")
         return
